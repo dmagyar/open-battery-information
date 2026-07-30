@@ -41,6 +41,23 @@ static uint16_t u16le(const uint8_t *buf, size_t idx) {
     return (uint16_t)buf[idx] | ((uint16_t)buf[idx + 1] << 8);
 }
 
+// The legacy USB path's PC client retries every transaction (2-5 attempts,
+// see arduino_obi.py's Interface.request()) before giving up, since a
+// single dropped/garbled 1-Wire slot isn't unusual. Wrap each bus
+// transaction the same way here instead of giving up after one attempt.
+template <typename Fn>
+static bool with_retry(uint8_t attempts, Fn fn) {
+    for (uint8_t i = 0; i < attempts; i++) {
+        if (fn()) {
+            return true;
+        }
+        if (i + 1 < attempts) {
+            delay(50);
+        }
+    }
+    return false;
+}
+
 // Skip ROM (0xCC) + function code, then read rsp_len bytes directly.
 // Unlike the legacy USB-framed cmd_and_read_cc(), this reads exactly what's
 // asked for -- no hidden offset quirks.
@@ -165,7 +182,8 @@ BatteryInfo read_info() {
 
     uint8_t rom[8];
     uint8_t msg[32];
-    if (!read_message(rom, msg)) {
+    bool got_message = with_retry(3, [&]() { return read_message(rom, msg); });
+    if (!got_message) {
         snprintf(info.error, sizeof(info.error), "No response from battery. Check it is seated correctly.");
         return info;
     }
@@ -182,7 +200,7 @@ BatteryInfo read_info() {
     info.charge_count = cc & 0x0FFF;
 
     char model[8];
-    if (read_model_standard(model)) {
+    if (with_retry(3, [&]() { return read_model_standard(model); })) {
         memcpy(info.model, model, 8);
         info.model[8] = '\0';
         info.kind = PackKind::STANDARD;
@@ -192,7 +210,7 @@ BatteryInfo read_info() {
     }
 
     uint8_t f0513[2];
-    if (read_model_f0513(f0513)) {
+    if (with_retry(3, [&]() { return read_model_f0513(f0513); })) {
         snprintf(info.model, sizeof(info.model), "BL%X%X", f0513[0], f0513[1]);
         send_clear(); // mirrors get_f0513_model()'s CLEAR_CMD follow-up
         info.kind = PackKind::F0513;
@@ -206,7 +224,7 @@ BatteryInfo read_info() {
     return info;
 }
 
-static BatteryData read_data_standard() {
+static BatteryData read_data_standard_once() {
     BatteryData d;
     memset(&d, 0, sizeof(d));
 
@@ -245,7 +263,21 @@ static BatteryData read_data_standard() {
     return d;
 }
 
-static BatteryData read_data_f0513() {
+static BatteryData read_data_standard() {
+    BatteryData d;
+    for (uint8_t i = 0; i < 3; i++) {
+        d = read_data_standard_once();
+        if (d.ok) {
+            return d;
+        }
+        if (i < 2) {
+            delay(50);
+        }
+    }
+    return d;
+}
+
+static BatteryData read_data_f0513_once() {
     BatteryData d;
     memset(&d, 0, sizeof(d));
 
@@ -293,6 +325,20 @@ static BatteryData read_data_f0513() {
     return d;
 }
 
+static BatteryData read_data_f0513() {
+    BatteryData d;
+    for (uint8_t i = 0; i < 3; i++) {
+        d = read_data_f0513_once();
+        if (d.ok) {
+            return d;
+        }
+        if (i < 2) {
+            delay(50);
+        }
+    }
+    return d;
+}
+
 BatteryData read_data() {
     if (g_pack_kind == PackKind::F0513) {
         return read_data_f0513();
@@ -301,7 +347,7 @@ BatteryData read_data() {
 }
 
 bool leds(bool on, char *error, size_t error_len) {
-    if (!enter_testmode()) {
+    if (!with_retry(3, enter_testmode)) {
         snprintf(error, error_len, "No response from battery while entering test mode.");
         return false;
     }
@@ -315,7 +361,7 @@ bool leds(bool on, char *error, size_t error_len) {
 }
 
 bool clear_errors(char *error, size_t error_len) {
-    if (!enter_testmode()) {
+    if (!with_retry(3, enter_testmode)) {
         snprintf(error, error_len, "No response from battery while entering test mode.");
         return false;
     }

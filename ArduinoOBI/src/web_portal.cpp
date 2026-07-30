@@ -183,6 +183,11 @@ void web_portal_begin() {
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID);
     WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+    // Modem sleep periodically parks the radio between beacon intervals,
+    // which can jitter the time-critical OneWire bit-banging in makita.cpp
+    // enough to drop a read/write. AP mode has no battery-life reason to
+    // keep it enabled here.
+    WiFi.setSleep(false);
 
     dnsServer.start(DNS_PORT, "*", AP_IP);
 
