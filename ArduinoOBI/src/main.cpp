@@ -1,21 +1,11 @@
 #include <Arduino.h>
 #include "OneWire2.h"
-
-/** Major version number (X.x.x) */
-#define ARDUINO_OBI_VERSION_MAJOR 0
-/** Minor version number (x.X.x) */
-#define ARDUINO_OBI_VERSION_MINOR 2
-/** Patch version number (x.x.X) */
-#define ARDUINO_OBI_VERSION_PATCH 1
+#include "pins.h"
+#include "version.h"
 
 #ifdef ESP_BUILD
-#define ONEWIRE_PIN ESP_OW_PIN
-#define ENABLE_PIN ESP_EN_PIN
-#else
-#define ONEWIRE_PIN 6
-#define ENABLE_PIN 8
+#include "web_portal.h"
 #endif
-
 
 OneWire makita(ONEWIRE_PIN);
 
@@ -80,6 +70,9 @@ void setup() {
     // One-wire
 	pinMode(ENABLE_PIN, OUTPUT);
 	//pinMode(2, OUTPUT);
+#ifdef ESP_BUILD
+	web_portal_begin();
+#endif
 }
 
 void send_usb(byte *rsp, byte rsp_len) {
@@ -174,4 +167,7 @@ void read_usb() {
 
 void loop() {
     read_usb();
+#ifdef ESP_BUILD
+    web_portal_loop();
+#endif
 }

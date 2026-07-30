@@ -77,3 +77,27 @@ To build the software for the ESP, make sure to select the corresponding
 platformio build env "esp32-c3-devkitm-1", the other steps are the same.
 
 To support other ESP chip types you have to change the board type and esp type in platformio.ini.
+
+A Lolin S2 Mini environment ("lolin_s2_mini") is also provided, using GPIO5 for ENABLE and
+GPIO7 for ONEWIRE — again, change ESP_EN_PIN/ESP_OW_PIN in platformio.ini if you wire it up
+differently. The same 3.3V pull-up warning above applies.
+
+---
+
+## WiFi captive portal (ESP builds)
+
+Any ESP build (esp32-c3-devkitm-1 or lolin_s2_mini) also hosts a standalone web UI, so you can
+read a battery from your phone without a PC:
+
+1. Flash and power the board as usual.
+2. On your phone, join the WiFi network **OBIWiFi** (open, no password).
+3. Your phone should prompt to open the sign-in/captive portal page automatically. If it
+   doesn't, open a browser and go to `http://192.168.4.1/`.
+4. Use the buttons to read the battery model/info, read live pack data, run the LED test, or
+   clear the error latch — the same operations as the Windows client's Makita LXT module. A
+   "Raw bytes" panel at the bottom shows the hex response for whatever you last read.
+
+"Reset Battery Message" is shown disabled in the UI on purpose — see PROTOCOL.md for why.
+
+This is in addition to, not instead of, the USB-serial connection the Windows/Python client
+uses — both work at the same time.
