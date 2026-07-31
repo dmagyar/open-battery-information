@@ -41,6 +41,28 @@ static uint16_t u16le(const uint8_t *buf, size_t idx) {
     return (uint16_t)buf[idx] | ((uint16_t)buf[idx + 1] << 8);
 }
 
+// Nybble-oriented helpers for the 32-byte "message" frame -- see
+// PROTOCOL.md's frame-repair section. Nybble n lives in byte n/2: the low
+// nybble if n is even, the high nybble if n is odd.
+static uint8_t nyb_get(const uint8_t *d, uint8_t n) {
+    return (n % 2 == 0) ? (d[n / 2] & 0x0F) : ((d[n / 2] >> 4) & 0x0F);
+}
+static void nyb_set(uint8_t *d, uint8_t n, uint8_t v) {
+    v &= 0x0F;
+    if (n % 2 == 0) {
+        d[n / 2] = (uint8_t)((d[n / 2] & 0xF0) | v);
+    } else {
+        d[n / 2] = (uint8_t)((d[n / 2] & 0x0F) | (v << 4));
+    }
+}
+static uint8_t checksum_calc(const uint8_t *d, uint8_t start_nyb, uint8_t end_nyb) {
+    uint8_t sum = 0;
+    for (uint8_t i = start_nyb; i <= end_nyb; i++) {
+        sum = (uint8_t)(sum + nyb_get(d, i));
+    }
+    return sum & 0x0F;
+}
+
 // The legacy USB path's PC client retries every transaction (2-5 attempts,
 // see arduino_obi.py's Interface.request()) before giving up, since a
 // single dropped/garbled 1-Wire slot isn't unusual. Wrap each bus
@@ -60,9 +82,11 @@ static bool with_retry(uint8_t attempts, Fn fn) {
 
 // Skip ROM (0xCC) + function code, then read rsp_len bytes directly.
 // Unlike the legacy USB-framed cmd_and_read_cc(), this reads exactly what's
-// asked for -- no hidden offset quirks.
-static void skiprom_cmd(const uint8_t *data, uint8_t data_len, uint8_t *rsp, uint8_t rsp_len) {
-    makita.reset();
+// asked for -- no hidden offset quirks. Returns whether the bus reset saw a
+// presence pulse (existing callers that only cared about all_ff() on the
+// response are free to ignore the return value).
+static bool skiprom_cmd(const uint8_t *data, uint8_t data_len, uint8_t *rsp, uint8_t rsp_len) {
+    bool present = makita.reset();
     delayMicroseconds(400);
     makita.write(0xCC, 0);
     for (uint8_t i = 0; i < data_len; i++) {
@@ -73,14 +97,15 @@ static void skiprom_cmd(const uint8_t *data, uint8_t data_len, uint8_t *rsp, uin
         delayMicroseconds(90);
         rsp[i] = makita.read();
     }
+    return present;
 }
 
 // Read ROM (0x33): capture the 8-byte ROM ID, write the function code, then
 // read rsp_len bytes. See PROTOCOL.md §5 for why the legacy USB-framed
 // cmd_and_read_33() can't be reused as-is (it discards the trailing 8 bytes
 // of the result).
-static void readrom_cmd(const uint8_t *data, uint8_t data_len, uint8_t rom[8], uint8_t *rsp, uint8_t rsp_len) {
-    makita.reset();
+static bool readrom_cmd(const uint8_t *data, uint8_t data_len, uint8_t rom[8], uint8_t *rsp, uint8_t rsp_len) {
+    bool present = makita.reset();
     delayMicroseconds(400);
     makita.write(0x33, 0);
     for (uint8_t i = 0; i < 8; i++) {
@@ -95,6 +120,7 @@ static void readrom_cmd(const uint8_t *data, uint8_t data_len, uint8_t rom[8], u
         delayMicroseconds(90);
         rsp[i] = makita.read();
     }
+    return present;
 }
 
 static void send_clear() {
@@ -104,14 +130,26 @@ static void send_clear() {
     bus_power(false);
 }
 
+// Test-mode entry/exit goes over Skip ROM (0xCC), not Read ROM (0x33).
+// The original OBI protocol used 0x33 here (see PROTOCOL.md), which some
+// BMS revisions apparently don't reliably accept -- some Makita LXT
+// Battery Monitor/Unlocker project (github.com/synrais) uses 0xCC and
+// reports it working across a much wider set of packs.
 static bool enter_testmode() {
-    uint8_t rom[8];
     uint8_t rsp[1];
     bus_power(true);
     const uint8_t cmd[3] = {0xD9, 0x96, 0xA5};
-    readrom_cmd(cmd, 3, rom, rsp, 1);
+    bool present = skiprom_cmd(cmd, 3, rsp, 1);
     bus_power(false);
-    return !all_ff(rom, 8);
+    return present;
+}
+
+static void exit_testmode() {
+    uint8_t rsp[1];
+    bus_power(true);
+    const uint8_t cmd[3] = {0xD9, 0xFF, 0xFF};
+    skiprom_cmd(cmd, 3, rsp, 1);
+    bus_power(false);
 }
 
 static bool read_message(uint8_t rom[8], uint8_t msg[32]) {
@@ -199,11 +237,23 @@ BatteryInfo read_info() {
     uint16_t cc = (uint16_t)((uint16_t)nibble_swap(msg[26]) << 8 | nibble_swap(msg[27]));
     info.charge_count = cc & 0x0FFF;
 
+    // What the charger itself checks -- see PROTOCOL.md's frame-repair
+    // section. This can disagree with `locked` above: a pack can have a
+    // clean failure code yet still be charger-locked (nybble 34 set from a
+    // prior charger lock event, or a corrupt checksum), which DA04 alone
+    // can never fix.
+    info.lock_cause_cs0 = checksum_calc(msg, 0, 15) != nyb_get(msg, 41);
+    info.lock_cause_cs2 = checksum_calc(msg, 32, 40) != nyb_get(msg, 43);
+    info.lock_cause_n34 = nyb_get(msg, 34) != 0;
+    info.charger_locked = info.lock_cause_cs0 || info.lock_cause_cs2 || info.lock_cause_n34;
+    bool new_family = msg[0] == 0xF1;
+
     char model[8];
     if (with_retry(3, [&]() { return read_model_standard(model); })) {
         memcpy(info.model, model, 8);
         info.model[8] = '\0';
         info.kind = PackKind::STANDARD;
+        info.frame_repair_supported = new_family;
         g_pack_kind = PackKind::STANDARD;
         info.ok = true;
         return info;
@@ -215,6 +265,7 @@ BatteryInfo read_info() {
         send_clear(); // mirrors get_f0513_model()'s CLEAR_CMD follow-up
         info.kind = PackKind::F0513;
         info.limited_diagnostics_only = true;
+        info.frame_repair_supported = false; // F0513 packs are read-only -- see PROTOCOL.md
         g_pack_kind = PackKind::F0513;
         info.ok = true;
         return info;
@@ -352,26 +403,181 @@ bool leds(bool on, char *error, size_t error_len) {
         return false;
     }
     uint8_t rom[8];
-    uint8_t rsp[1];
+    uint8_t rsp[9]; // full response, not just the first byte -- see PROTOCOL.md
     bus_power(true);
     const uint8_t cmd[2] = {0xDA, (uint8_t)(on ? 0x31 : 0x34)};
-    readrom_cmd(cmd, 2, rom, rsp, 1);
+    readrom_cmd(cmd, 2, rom, rsp, 9);
     bus_power(false);
+    exit_testmode();
     return true;
 }
 
-bool clear_errors(char *error, size_t error_len) {
+// Sends DA04 (error-register clear) and reports whether the bus stayed
+// present throughout. Does not by itself tell you whether the pack is
+// unlocked afterward -- call read_message()/read_info() again to check.
+static bool send_da04() {
     if (!with_retry(3, enter_testmode)) {
-        snprintf(error, error_len, "No response from battery while entering test mode.");
         return false;
     }
     uint8_t rom[8];
-    uint8_t rsp[1];
+    uint8_t rsp[9];
     bus_power(true);
     const uint8_t cmd[2] = {0xDA, 0x04};
-    readrom_cmd(cmd, 2, rom, rsp, 1);
+    bool present = readrom_cmd(cmd, 2, rom, rsp, 9);
     bus_power(false);
+    exit_testmode();
+    return present;
+}
+
+// Frame write, arm+write+store -- see PROTOCOL.md's frame-repair section.
+// `frame` must already have nybble 34/CS0/CS2 corrected by the caller.
+static bool write_frame(const uint8_t frame[32]) {
+    if (!with_retry(3, enter_testmode)) {
+        return false;
+    }
+
+    // Arm: tells the BMS a frame write is coming.
+    {
+        uint8_t rsp[32];
+        bus_power(true);
+        const uint8_t cmd[2] = {0xF0, 0x00};
+        bool present = skiprom_cmd(cmd, 2, rsp, 32);
+        bus_power(false);
+        if (!present) {
+            exit_testmode();
+            return false;
+        }
+    }
+    delay(30);
+
+    // Write: opcode 0x0F, a pad byte, then the 32-byte frame verbatim.
+    {
+        uint8_t rom[8];
+        uint8_t payload[2 + 32];
+        payload[0] = 0x0F;
+        payload[1] = 0x00;
+        memcpy(&payload[2], frame, 32);
+        bus_power(true);
+        bool present = readrom_cmd(payload, sizeof(payload), rom, nullptr, 0);
+        bus_power(false);
+        if (!present) {
+            exit_testmode();
+            return false;
+        }
+    }
+    delay(30);
+
+    // Store: commits the write to flash.
+    {
+        uint8_t rom[8];
+        const uint8_t cmd[2] = {0x55, 0xA5};
+        bus_power(true);
+        bool present = readrom_cmd(cmd, 2, rom, nullptr, 0);
+        bus_power(false);
+        if (!present) {
+            exit_testmode();
+            return false;
+        }
+    }
+    delay(30);
+
+    exit_testmode();
     return true;
+}
+
+// One frame-repair attempt: zero nybble 34, recalculate CS0/CS2, write the
+// frame back, then poll until the BMS responds again (it goes bus-silent
+// for up to a few seconds while committing to flash) and re-read it.
+// `msg` is both input and output: replaced with the freshly re-read frame
+// on success so the caller can immediately check whether it's unlocked.
+static bool repair_frame_once(uint8_t msg[32]) {
+    uint8_t frame[32];
+    memcpy(frame, msg, 32);
+    frame[17] = (uint8_t)(frame[17] & 0xF0); // zero nybble 34, preserve nybble 35
+    nyb_set(frame, 41, checksum_calc(frame, 0, 15));  // CS0
+    nyb_set(frame, 43, checksum_calc(frame, 32, 40)); // CS2
+
+    if (!write_frame(frame)) {
+        return false;
+    }
+
+    uint8_t rom[8];
+    uint8_t verify[32];
+    uint32_t start = millis();
+    bool got = false;
+    while (millis() - start < 5000) {
+        if (read_message(rom, verify)) {
+            got = true;
+            break;
+        }
+        delay(200);
+    }
+    if (!got) {
+        return false;
+    }
+    memcpy(msg, verify, 32);
+    return true;
+}
+
+static void fill_lock_causes(const uint8_t msg[32], UnlockResult &r) {
+    r.lock_cause_cs0 = checksum_calc(msg, 0, 15) != nyb_get(msg, 41);
+    r.lock_cause_cs2 = checksum_calc(msg, 32, 40) != nyb_get(msg, 43);
+    r.lock_cause_n34 = nyb_get(msg, 34) != 0;
+}
+
+// Attempt 1: DA04 error-register clear -- handles ordinary overdischarge/
+// overload locks. If the pack is still locked by the charger's own
+// criteria (nybble 34, CS0, CS2 -- see PROTOCOL.md), falls back to up to 6
+// rounds of frame repair, matching the synrais Makita LXT Battery
+// Monitor/Unlocker project's tested behavior. Frame repair is only
+// attempted on new-family (byte0=0xF1) standard packs; F0513 and
+// unrecognized frame layouts are left untouched.
+UnlockResult unlock() {
+    UnlockResult result;
+    memset(&result, 0, sizeof(result));
+
+    uint8_t rom[8];
+    uint8_t msg[32];
+
+    send_da04();
+    delay(200); // BMS settle time after DA04, per PROTOCOL.md
+    if (!with_retry(5, [&]() { return read_message(rom, msg); })) {
+        snprintf(result.error, sizeof(result.error), "No response from battery after DA04.");
+        return result;
+    }
+
+    fill_lock_causes(msg, result);
+    if (!result.lock_cause_cs0 && !result.lock_cause_cs2 && !result.lock_cause_n34) {
+        result.ok = true;
+        snprintf(result.method, sizeof(result.method), "da04");
+        return result;
+    }
+
+    if (g_pack_kind != PackKind::STANDARD || msg[0] != 0xF1) {
+        result.frame_repair_supported = false;
+        snprintf(result.error, sizeof(result.error),
+                 "Still locked after DA04. Frame repair isn't supported for this pack.");
+        return result;
+    }
+    result.frame_repair_supported = true;
+
+    for (uint8_t attempt = 1; attempt <= 6; attempt++) {
+        if (repair_frame_once(msg)) {
+            fill_lock_causes(msg, result);
+            result.frame_repair_attempts = attempt;
+            if (!result.lock_cause_cs0 && !result.lock_cause_cs2 && !result.lock_cause_n34) {
+                result.ok = true;
+                snprintf(result.method, sizeof(result.method), "frame-repair");
+                return result;
+            }
+        } else {
+            result.frame_repair_attempts = attempt;
+        }
+    }
+
+    snprintf(result.error, sizeof(result.error),
+             "Still locked after DA04 and %u frame-repair attempt(s).", result.frame_repair_attempts);
+    return result;
 }
 
 } // namespace makita_lxt

@@ -24,8 +24,18 @@ struct BatteryInfo {
     float capacity_ah;
     uint8_t battery_type;
     uint16_t charge_count;
-    bool locked;
+    bool locked; // true if the BMS failure-code nybble is non-zero (informational -- NOT what the charger checks)
     uint8_t status_code;
+
+    // What the charger itself actually validates before allowing charge --
+    // see PROTOCOL.md. A pack can show `locked=false` above yet still be
+    // charger_locked, or vice versa; these are two different fields in the
+    // same 32-byte frame.
+    bool charger_locked;
+    bool lock_cause_cs0;  // nybble 41 checksum (nybbles 0-15) mismatch
+    bool lock_cause_cs2;  // nybble 43 checksum (nybbles 32-40) mismatch
+    bool lock_cause_n34;  // nybble 34 (charger lock nybble) is non-zero
+    bool frame_repair_supported; // new-family (byte0=0xF1) STANDARD pack -- the only layout frame repair is verified against
 };
 
 struct BatteryData {
@@ -44,14 +54,31 @@ struct BatteryData {
 };
 
 // Current best-known pack family, set by a successful read_info() call and
-// consumed by read_data()/leds()/clear_errors() — mirrors the PC client's
+// consumed by read_data()/leds()/unlock() — mirrors the PC client's
 // ModuleApplication.command_version instance state.
 PackKind last_pack_kind();
 
 BatteryInfo read_info();
 BatteryData read_data();
 bool leds(bool on, char *error, size_t error_len);
-bool clear_errors(char *error, size_t error_len);
+
+struct UnlockResult {
+    bool ok;
+    char error[96];
+    char method[16]; // "da04" or "frame-repair" once ok; "" if nothing worked
+    uint8_t frame_repair_attempts;
+    bool frame_repair_supported;
+    bool lock_cause_cs0;
+    bool lock_cause_cs2;
+    bool lock_cause_n34;
+};
+
+// Replaces the old DA04-only clear_errors(): tries the standard error-reset
+// first, and if the pack is still locked by the charger's own criteria,
+// falls back to reading/repairing the 32-byte frame in place (see
+// PROTOCOL.md). Read-only ("locked" query) is available via read_info()'s
+// lock_cause_* fields without calling this.
+UnlockResult unlock();
 
 } // namespace makita_lxt
 

@@ -94,6 +94,7 @@ pre {
   margin: .5rem 0 0;
 }
 details summary { cursor: pointer; font-weight: 600; }
+.hint { margin: .5rem 0 0; color: var(--muted); font-size: .8rem; }
 #toast {
   position: fixed;
   left: 50%;
@@ -141,8 +142,9 @@ details summary { cursor: pointer; font-weight: 600; }
     <div class="btn-row">
       <button id="btnLedsOn" data-action="1" data-requires-info="1" disabled class="secondary">LED Test ON</button>
       <button id="btnLedsOff" data-action="1" data-requires-info="1" disabled class="secondary">LED Test OFF</button>
-      <button id="btnClearErrors" data-action="1" data-requires-info="1" disabled>Clear Errors</button>
+      <button id="btnUnlock" data-action="1" data-requires-info="1" disabled>Unlock Battery</button>
     </div>
+    <p id="unlockHint" class="hint">Tries a quick error reset first, then a frame repair if needed &mdash; can take up to ~30s.</p>
     <div class="btn-row" style="margin-top:.5rem">
       <button id="btnResetMsg" disabled class="secondary" title="Not implemented - disabled for safety, see PROTOCOL.md">Reset Battery Message</button>
     </div>
@@ -211,6 +213,18 @@ details summary { cursor: pointer; font-weight: 600; }
     $('rawBytes').textContent = (hex && hex.length) ? hex : '(none yet)';
   }
 
+  // The failure-code nybble ("State" below) and the fields the charger
+  // itself checks (nybble 34 + two checksums) are different parts of the
+  // same frame and can disagree -- see PROTOCOL.md. Both are shown.
+  function lockSummary(cs0, cs2, n34) {
+    if (!cs0 && !cs2 && !n34) return 'UNLOCKED';
+    var causes = [];
+    if (cs0) causes.push('CS0');
+    if (cs2) causes.push('CS2');
+    if (n34) causes.push('lock nybble');
+    return 'LOCKED (' + causes.join(', ') + ')';
+  }
+
   function readInfo() {
     setBusy(true);
     api('/api/read-info').then(function (d) {
@@ -220,7 +234,8 @@ details summary { cursor: pointer; font-weight: 600; }
       row(tbody, 'Pack type', d.kind === 'f0513' ? 'F0513 (limited diagnostics)' : 'Standard');
       row(tbody, 'ROM ID', d.romId);
       row(tbody, 'Charge count*', d.chargeCount);
-      row(tbody, 'State', d.locked ? 'LOCKED' : 'UNLOCKED');
+      row(tbody, 'State (failure code)', d.locked ? 'LOCKED' : 'UNLOCKED');
+      row(tbody, 'Charger lock', lockSummary(d.lockCauseCs0, d.lockCauseCs2, d.lockCauseN34));
       row(tbody, 'Status code', d.statusCode);
       row(tbody, 'Manufacturing date', d.mfgDate);
       row(tbody, 'Capacity', d.capacityAh + ' Ah');
@@ -268,6 +283,37 @@ details summary { cursor: pointer; font-weight: 600; }
     });
   }
 
+  // Bypasses the shared api() helper (which rejects on ok:false) because
+  // the lock-cause fields in a failed unlock response are still wanted
+  // here, not just an error string.
+  function runUnlock() {
+    setBusy(true);
+    toast('Unlocking... this can take up to ~30s', false);
+    fetch('/api/unlock', { method: 'POST' }).then(function (res) {
+      return res.json();
+    }).then(function (r) {
+      var tbody = $('infoTable');
+      var causeRow = null;
+      for (var i = 0; i < tbody.rows.length; i++) {
+        if (tbody.rows[i].cells[0].textContent === 'Charger lock') { causeRow = tbody.rows[i]; break; }
+      }
+      var summary = lockSummary(r.lockCauseCs0, r.lockCauseCs2, r.lockCauseN34);
+      if (causeRow) causeRow.cells[1].textContent = summary;
+
+      if (r.ok) {
+        toast(r.method === 'frame-repair'
+          ? 'Unlocked via frame repair (' + r.frameRepairAttempts + ' attempt(s))'
+          : 'Unlocked via error reset', false);
+      } else {
+        toast(r.error || 'Unlock failed', true);
+      }
+    }).catch(function () {
+      toast('Bad response from device', true);
+    }).finally(function () {
+      setBusy(false);
+    });
+  }
+
   function loadVersion() {
     api('/api/version').then(function (v) {
       $('fwVersion').textContent = v.major + '.' + v.minor + '.' + v.patch;
@@ -279,7 +325,7 @@ details summary { cursor: pointer; font-weight: 600; }
     $('btnReadData').addEventListener('click', readData);
     $('btnLedsOn').addEventListener('click', function () { doAction('/api/leds-on', 'LEDs on'); });
     $('btnLedsOff').addEventListener('click', function () { doAction('/api/leds-off', 'LEDs off'); });
-    $('btnClearErrors').addEventListener('click', function () { doAction('/api/clear-errors', 'Errors cleared'); });
+    $('btnUnlock').addEventListener('click', runUnlock);
     setBusy(false);
     loadVersion();
   });

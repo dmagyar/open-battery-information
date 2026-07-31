@@ -106,6 +106,14 @@ static void handleApiReadInfo() {
     snprintf(statusHex, sizeof(statusHex), "%02X", info.status_code);
     out += ",\"statusCode\":";
     json_append_escaped(out, statusHex);
+
+    // What the charger itself validates -- see PROTOCOL.md. Can disagree
+    // with `locked` above.
+    out += ",\"chargerLocked\":" + String(info.charger_locked ? "true" : "false");
+    out += ",\"lockCauseCs0\":" + String(info.lock_cause_cs0 ? "true" : "false");
+    out += ",\"lockCauseCs2\":" + String(info.lock_cause_cs2 ? "true" : "false");
+    out += ",\"lockCauseN34\":" + String(info.lock_cause_n34 ? "true" : "false");
+    out += ",\"frameRepairSupported\":" + String(info.frame_repair_supported ? "true" : "false");
     out += "}";
     sendJson(200, out);
 }
@@ -159,14 +167,26 @@ static void handleApiLeds(bool on) {
 static void handleApiLedsOn() { handleApiLeds(true); }
 static void handleApiLedsOff() { handleApiLeds(false); }
 
-static void handleApiClearErrors() {
-    char err[64] = {0};
-    bool ok = makita_lxt::clear_errors(err, sizeof(err));
-    String out = "{\"ok\":" + String(ok ? "true" : "false");
-    if (!ok) {
+// Tries DA04 first, then falls back to frame repair if the pack is still
+// locked by the charger's own criteria -- see PROTOCOL.md. Can take up to
+// ~30s worst case if several frame-repair rounds are needed; the frontend
+// shows a "this can take a while" notice while it's in flight.
+static void handleApiUnlock() {
+    makita_lxt::UnlockResult r = makita_lxt::unlock();
+
+    String out = "{\"ok\":" + String(r.ok ? "true" : "false");
+    if (r.ok) {
+        out += ",\"method\":";
+        json_append_escaped(out, r.method);
+    } else {
         out += ",\"error\":";
-        json_append_escaped(out, err);
+        json_append_escaped(out, r.error);
     }
+    out += ",\"frameRepairSupported\":" + String(r.frame_repair_supported ? "true" : "false");
+    out += ",\"frameRepairAttempts\":" + String(r.frame_repair_attempts);
+    out += ",\"lockCauseCs0\":" + String(r.lock_cause_cs0 ? "true" : "false");
+    out += ",\"lockCauseCs2\":" + String(r.lock_cause_cs2 ? "true" : "false");
+    out += ",\"lockCauseN34\":" + String(r.lock_cause_n34 ? "true" : "false");
     out += "}";
     sendJson(200, out);
 }
@@ -204,7 +224,7 @@ void web_portal_begin() {
     server.on("/api/read-data", HTTP_GET, handleApiReadData);
     server.on("/api/leds-on", HTTP_POST, handleApiLedsOn);
     server.on("/api/leds-off", HTTP_POST, handleApiLedsOff);
-    server.on("/api/clear-errors", HTTP_POST, handleApiClearErrors);
+    server.on("/api/unlock", HTTP_POST, handleApiUnlock);
     server.on("/api/reset-message", HTTP_POST, handleApiResetMessage);
 
     server.onNotFound(handleRoot);

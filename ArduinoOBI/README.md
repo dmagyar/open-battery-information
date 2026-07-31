@@ -94,8 +94,11 @@ read a battery from your phone without a PC:
 3. Your phone should prompt to open the sign-in/captive portal page automatically. If it
    doesn't, open a browser and go to `http://192.168.4.1/`.
 4. Use the buttons to read the battery model/info, read live pack data, run the LED test, or
-   clear the error latch — the same operations as the Windows client's Makita LXT module. A
-   "Raw bytes" panel at the bottom shows the hex response for whatever you last read.
+   unlock the battery. Unlock tries a standard error reset first and, if the pack is still
+   locked by the fields the charger actually checks, automatically falls back to a targeted
+   frame repair (can take up to ~30s) — see PROTOCOL.md §7 for how this works and why DA04
+   alone doesn't unlock every pack. A "Raw bytes" panel at the bottom shows the hex response
+   for whatever you last read.
 
 "Reset Battery Message" is shown disabled in the UI on purpose — see PROTOCOL.md for why.
 

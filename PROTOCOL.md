@@ -369,7 +369,7 @@ on the `OBIWiFi` network can call these.
 | GET | `/api/read-data` | `on_read_data_click()` | Uses whichever pack kind the last successful `read-info` call detected. |
 | POST | `/api/leds-on` | `on_all_leds_on_click()` | Enters test mode, then LED-on. |
 | POST | `/api/leds-off` | `on_all_leds_off_click()` | Enters test mode, then LED-off. |
-| POST | `/api/clear-errors` | `on_reset_errors_click()` | Enters test mode, then clears the error latch. |
+| POST | `/api/unlock` | `on_reset_errors_click()`, extended | DA04 error-reset, falling back to frame repair if the pack is still charger-locked. See [§7](#7-unlocking-da04-and-frame-repair). Can take up to ~30s. |
 | POST | `/api/reset-message` | `on_reset_message_click()` | Always returns `501`. Intentionally not wired up — see below. |
 
 `GET /api/read-info` response (success):
@@ -387,7 +387,12 @@ on the `OBIWiFi` network can call these.
   "batteryType": 3,
   "chargeCount": 128,
   "locked": false,
-  "statusCode": "00"
+  "statusCode": "00",
+  "chargerLocked": false,
+  "lockCauseCs0": false,
+  "lockCauseCs2": false,
+  "lockCauseN34": false,
+  "frameRepairSupported": true
 }
 ```
 
@@ -396,6 +401,11 @@ is `true` in that case, matching the PC client's `messagebox.showwarning`.
 Any endpoint can instead return `{"ok": false, "error": "..."}` — the same
 "no response" / "all `0xFF`" detection from §2.2 applies, since the native
 helpers still check for an unresponsive bus before parsing.
+
+`locked` and `chargerLocked`/`lockCause*` are **not the same signal** — see
+[§7](#7-unlocking-da04-and-frame-repair). `locked` is the BMS failure-code
+nybble (informational); `chargerLocked` is whether the fields the charger
+itself actually validates are clean. A pack can disagree between the two.
 
 `GET /api/read-data` response (success):
 
@@ -426,3 +436,129 @@ way — and more importantly, this command writes directly to the battery's
 stored diagnostic frame. It should stay disabled until that's fixed and
 verified against real hardware, not silently enabled just because the
 native command layer doesn't have the same framing bug.
+
+---
+
+## 7. Unlocking: DA04 and frame repair
+
+The web portal's original unlock path was DA04 alone (§3.1's
+`RESET_ERROR_CMD`), inherited unchanged from the PC client. In practice
+this doesn't unlock every pack. This section documents why, and the fix
+implemented in `makita.cpp`'s `unlock()`.
+
+Credit: this section is derived from reverse-engineering work in
+[synrais/Makita-LXT-Battery-Monitor-Unlocker](https://github.com/synrais/Makita-LXT-Battery-Monitor-Unlocker)
+(`BYTE_REFERENCE.md`, `FRAME_REFERENCE.md`), which documents byte-level
+frame contents and checksum behavior across 20+ real battery frames and
+193 individual charger-validation field tests. It is not this repo's own
+testing — treat it as a well-supported secondary source, not a spec.
+
+### 7.1 Two different "locked" signals
+
+The 32-byte message frame (the same one `READ_MSG_CMD`/`AA 00` returns,
+§3.1) contains two *independent* signals that both get loosely called
+"lock state":
+
+1. **The BMS failure code** — nybble 40 (low nybble of `message[20]`).
+   `0x0`=OK, `0x1`=overloaded, `0x5`=warning, `0xF`=dead. This is what the
+   original `locked` field / `on_read_static_click()`'s "State" reflects.
+   DA04 clears this.
+2. **What the charger itself checks before allowing charge** — confirmed by
+   exhaustive field-by-field testing to be exactly three things:
+
+   | Field | Nybble | Required | Effect if wrong |
+   |---|---|---|---|
+   | Charger lock nybble | 34 (low nybble of `message[17]`) | `0x0` | Battery LOCKED |
+   | CS0 checksum | 41 (high nybble of `message[20]`) | `sum(nybbles 0–15) & 0x0F` | Battery LOCKED |
+   | CS2 checksum | 43 (high nybble of `message[21]`) | `sum(nybbles 32–40) & 0x0F` | Battery LOCKED |
+
+   Everything else in the frame — including the failure code above, CS1,
+   the AUX checksums, cycle count, health history — is confirmed to have
+   **no effect** on whether the charger accepts the pack.
+
+These two signals can disagree. A pack can have failure code `0x0` (shows
+"UNLOCKED" by the old logic) while nybble 34 is still non-zero from a prior
+charger-side lock event — DA04 cannot touch nybble 34, so that pack stays
+rejected by the charger no matter how many times DA04 runs. This is almost
+certainly why "unlocking doesn't work on some batteries" with DA04 alone.
+
+Nybble numbering: nybble `n` lives in byte `n/2` of the message — the low
+nybble if `n` is even, the high nybble if `n` is odd. E.g. nybble 34 is the
+low nybble of `message[17]`, nybble 41 is the high nybble of `message[20]`.
+
+### 7.2 Test-mode entry/exit: Skip ROM, not Read ROM
+
+The original protocol's `TESTMODE_CMD` (§3.1) goes over `0x33` (Read ROM).
+The synrais project instead enters and exits test mode over `0xCC` (Skip
+ROM):
+
+```
+Enter: reset, write 0xCC, write [0xD9, 0x96, 0xA5], read 1 byte
+Exit:  reset, write 0xCC, write [0xD9, 0xFF, 0xFF], read 1 byte
+```
+
+`makita.cpp`'s `enter_testmode()`/`exit_testmode()` now do this. The
+`0x33`-based DA04 command itself (see below) is unchanged — only the
+test-mode bracketing around it moved to Skip ROM. Whether this alone fixes
+unlocking on a given pack, versus needing the frame-repair fallback below,
+depends on the specific BMS revision.
+
+Also fixed: the native DA04/LED commands now read the full 9-byte response
+after the ROM prefix, not just the first byte, and explicitly exit test
+mode afterward. The legacy USB-framed path (§2.4) already reads 9 bytes
+internally — the native path had trimmed this to 1 (the only byte the USB
+framing actually forwards, per §5), which may leave some BMS chips mid-
+transaction when the bus resets for the next command.
+
+### 7.3 Frame repair
+
+If DA04 doesn't clear nybble 34/CS0/CS2, the fix is a targeted read-modify-
+write of the frame: read it, zero nybble 34, recompute CS0 and CS2, write
+it back. Every other byte — cycle count, overdischarge/overload counters,
+capacity, health history, CS1, AUX checksums — is preserved untouched.
+
+This is only attempted for **new-family packs** (`message[0] == 0xF1`,
+covering BL1830B/BL1840B/BL1850B/BL1860B and similar) that were identified
+via the standard (non-F0513) model read. Older-family packs (`message[0]
+== 0x50`) use a different, undocumented-here frame layout, and F0513 packs
+are excluded entirely — same as the PC client and the synrais project,
+which both treat F0513 as read-only because a bad write there risks
+permanently bricking the pack. `frameRepairSupported` in the API reflects
+this gate.
+
+**Write sequence** (`write_frame()` in `makita.cpp`), each step its own
+bus-power cycle:
+
+```
+1. Enter test mode (§7.2)
+2. Arm:   Skip ROM, write [0xF0, 0x00], read 32 bytes
+3. Write: Read ROM (8 ROM bytes discarded), write [0x0F, 0x00, <32-byte frame>], read 0 bytes
+4. Store: Read ROM (8 ROM bytes discarded), write [0x55, 0xA5], read 0 bytes
+5. Exit test mode (§7.2)
+```
+
+After a write, the BMS goes bus-silent for up to a few seconds while it
+commits to flash. `repair_frame_once()` polls (`READ_MSG_CMD`, up to 5s)
+until it responds again, then re-reads the frame to check whether nybble
+34/CS0/CS2 are now clean.
+
+### 7.4 Unlock orchestration
+
+`unlock()` (`makita.cpp`), exposed as `POST /api/unlock`:
+
+```
+1. Send DA04 (§7.2), wait ~200ms, re-read the frame.
+2. If nybble 34, CS0, and CS2 are all now clean → done, method="da04".
+3. Else, if frame repair isn't supported for this pack → report locked, stop.
+4. Else, run frame repair (§7.3) up to 6 times, re-checking after each
+   attempt, matching the synrais project's tested attempt count. Stops as
+   soon as a pass reports clean → method="frame-repair".
+5. If still locked after all attempts → report failure with the current
+   lock causes.
+```
+
+Because of the polling waits in steps 1 and 4, a full 6-attempt run can
+take on the order of 30 seconds; the web UI shows a "this can take a
+while" notice while the request is in flight. Per the synrais project's
+testing, most packs unlock on the DA04 pass or the first frame-repair
+attempt.
